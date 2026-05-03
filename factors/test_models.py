@@ -30,6 +30,8 @@ from factors.models import (
     WalkForwardCV,
     ModelPersistence,
     FeatureImportanceTracker,
+    TRAINING_TIME_THRESHOLD_SECONDS,
+    TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS,
 )
 
 
@@ -229,7 +231,8 @@ class TestXGBoostModel:
     def test_model_initialization(self):
         """Test that model initializes with correct default parameters."""
         model = XGBoostModel()
-        assert model.model_type in ["xgboost", "lightgbm"]
+        # Accept xgboost, lightgbm, or gradient_boosting (fallback)
+        assert model.model_type in ["xgboost", "lightgbm", "gradient_boosting"]
         assert model.is_fitted is False
 
     def test_fit_with_valid_data(self):
@@ -678,6 +681,47 @@ class TestReturnForecaster:
         assert "oos_r2_std" in results
         assert "ic_mean" in results
         assert results["num_splits"] == 3
+    
+    def test_validate_out_of_sample_r2_threshold(self):
+        """Test that out-of-sample validation includes R² threshold check."""
+        pytest.importorskip("sklearn", reason="sklearn required for cross-validation")
+        
+        np.random.seed(42)
+        n_samples = 200
+        n_features = 5
+        
+        X = pd.DataFrame(
+            np.random.randn(n_samples, n_features),
+            columns=[f"factor_{i}" for i in range(n_features)]
+        )
+        y = pd.Series(np.random.randn(n_samples))
+        
+        forecaster = ReturnForecaster()
+        results = forecaster.validate_out_of_sample(X, y, n_cv_folds=3)
+        
+        assert "oos_r2_meets_threshold" in results
+        assert isinstance(results["oos_r2_meets_threshold"], bool)
+    
+    def test_training_time_within_threshold(self):
+        """Test that model training time is within threshold."""
+        np.random.seed(42)
+        X = pd.DataFrame(np.random.randn(100, 5), columns=[f"f{i}" for i in range(5)])
+        y = pd.Series(np.random.randn(100))
+        
+        # Linear Regression (should be fast)
+        model = LinearRegressionModel(feature_names=X.columns.tolist())
+        model.fit(X, y)
+        assert model.training_time_ < TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS
+        
+        # Random Forest (should be fast with small data)
+        rf_model = RandomForestModel(n_estimators=10, random_state=42)
+        rf_model.fit(X, y)
+        assert rf_model.training_time_ < TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS
+        
+        # XGBoost (should be fast with small data)
+        xgb_model = XGBoostModel(n_estimators=10, random_state=42, verbosity=0)
+        xgb_model.fit(X, y)
+        assert xgb_model.training_time_ < TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS
 
     def test_forecast_for_date(self):
         """Test generating forecasts for a specific date."""

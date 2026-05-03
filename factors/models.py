@@ -25,6 +25,10 @@ import json
 import time
 from pathlib import Path
 
+# Training time thresholds
+TRAINING_TIME_THRESHOLD_SECONDS = 1800  # 30 minutes (PRD requirement)
+TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS = 600  # 10 minutes per single model (Quality Requirement)
+
 logger = logging.getLogger(__name__)
 
 # Check for optional dependencies
@@ -162,9 +166,9 @@ class LinearRegressionModel(BaseModel):
         
         # Use sklearn if available
         if HAS_SKLEARN and SKLinearRegression is not None:
+            # Note: normalize parameter removed in sklearn 1.0+, handle normalization manually if needed
             self._sklearn_model = SKLinearRegression(
-                fit_intercept=fit_intercept,
-                normalize=normalize
+                fit_intercept=fit_intercept
             )
     
     def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> 'LinearRegressionModel':
@@ -223,6 +227,13 @@ class LinearRegressionModel(BaseModel):
         
         self.is_fitted = True
         self.training_time_ = time.time() - start_time
+        
+        # Check training time threshold
+        if self.training_time_ > TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS:
+            logger.warning(
+                f"LinearRegression training time {self.training_time_:.2f}s exceeds "
+                f"single model threshold {TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS}s"
+            )
         
         # Calculate feature importance (absolute coefficients)
         if self.coefficients_ is not None:
@@ -365,6 +376,13 @@ class RandomForestModel(BaseModel):
         
         self.is_fitted = True
         self.training_time_ = time.time() - start_time
+        
+        # Check training time threshold
+        if self.training_time_ > TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS:
+            logger.warning(
+                f"RandomForest training time {self.training_time_:.2f}s exceeds "
+                f"single model threshold {TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS}s"
+            )
         
         # Store feature importances
         if hasattr(self._sklearn_model, "feature_importances_"):
@@ -553,6 +571,13 @@ class XGBoostModel(BaseModel):
         self.is_fitted = True
         self.training_time_ = time.time() - start_time
         
+        # Check training time threshold
+        if self.training_time_ > TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS:
+            logger.warning(
+                f"XGBoost training time {self.training_time_:.2f}s exceeds "
+                f"single model threshold {TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS}s"
+            )
+        
         # Store feature importance
         if hasattr(self._model, "feature_importances_"):
             importances = self._model.feature_importances_
@@ -582,6 +607,202 @@ class XGBoostModel(BaseModel):
         
         predictions = self._model.predict(X.values)
         return pd.Series(predictions, index=X.index)
+
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
+    logger.warning("PyTorch not available, LSTM model will use fallback")
+
+
+class LSTMModel(BaseModel):
+    """LSTM model for sequential time series patterns (optional per PRD Section 4.5)."""
+    
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        sequence_length: int = 20,
+        feature_names: Optional[List[str]] = None,
+        random_state: Optional[int] = None
+    ):
+        """Initialize LSTM model.
+        
+        Args:
+            hidden_dim: Hidden dimension of LSTM
+            num_layers: Number of LSTM layers
+            sequence_length: Length of input sequences
+            feature_names: List of feature names
+            random_state: Random seed
+        """
+        super().__init__("lstm")
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.sequence_length = sequence_length
+        self.feature_names = feature_names
+        self.random_state = random_state
+        self._model = None
+        self._device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu") if HAS_TORCH else None
+        
+        if HAS_TORCH and nn is not None:
+            self._init_lstm_model()
+        else:
+            self._fallback_model = LinearRegressionModel(feature_names=feature_names)
+    
+    def _init_lstm_model(self):
+        """Initialize PyTorch LSTM model."""
+        if not HAS_TORCH or nn is None:
+            return
+        
+        n_features = len(self.feature_names) if self.feature_names else 1
+        
+        class LSTMNet(nn.Module):
+            def __init__(self, n_features, hidden_dim, num_layers):
+                super().__init__()
+                self.lstm = nn.LSTM(
+                    input_size=n_features,
+                    hidden_size=hidden_dim,
+                    num_layers=num_layers,
+                    batch_first=True
+                )
+                self.fc = nn.Linear(hidden_dim, 1)
+            
+            def forward(self, x):
+                lstm_out, (h_n, c_n) = self.lstm(x)
+                # Use last hidden state
+                out = self.fc(h_n[-1, :, :])
+                return out.squeeze(-1)
+        
+        self._model = LSTMNet(n_features, self.hidden_dim, self.num_layers).to(self._device)
+        self._optimizer = torch.optim.Adam(self._model.parameters(), lr=0.001)
+        self._criterion = nn.MSELoss()
+    
+    def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> 'LSTMModel':
+        """Fit LSTM model.
+        
+        Args:
+            X: Feature DataFrame (n_samples, n_features)
+            y: Target Series (n_samples,)
+            
+        Returns:
+            self
+        """
+        start_time = time.time()
+        
+        if self.feature_names is None:
+            self.feature_names = X.columns.tolist()
+        
+        if not HAS_TORCH or self._model is None:
+            # Fallback to linear model
+            self._fallback_model.fit(X, y)
+            self.is_fitted = True
+            self.training_time_ = time.time() - start_time
+            return self
+        
+        # Prepare sequences
+        X_seq, y_seq = self._prepare_sequences(X.values, y.values)
+        
+        if len(X_seq) == 0:
+            logger.warning("Not enough data for LSTM sequences, using fallback")
+            self._fallback_model.fit(X, y)
+            self.is_fitted = True
+            self.training_time_ = time.time() - start_time
+            return self
+        
+        # Convert to tensors
+        X_tensor = torch.tensor(X_seq, dtype=torch.float32).to(self._device)
+        y_tensor = torch.tensor(y_seq, dtype=torch.float32).to(self._device)
+        
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        # Train
+        self._model.train()
+        epochs = 10
+        for _ in range(epochs):
+            for batch_X, batch_y in dataloader:
+                self._optimizer.zero_grad()
+                predictions = self._model(batch_X)
+                loss = self._criterion(predictions, batch_y)
+                loss.backward()
+                self._optimizer.step()
+        
+        self.is_fitted = True
+        self.training_time_ = time.time() - start_time
+        
+        # Check training time threshold
+        if self.training_time_ > TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS:
+            logger.warning(
+                f"LSTM training time {self.training_time_:.2f}s exceeds "
+                f"single model threshold {TRAINING_TIME_THRESHOLD_SINGLE_MODEL_SECONDS}s"
+            )
+        
+        return self
+    
+    def _prepare_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare sequence data for LSTM.
+        
+        Args:
+            X: Feature array (n_samples, n_features)
+            y: Target array (n_samples,)
+            
+        Returns:
+            Tuple of (X_sequences, y_sequences)
+        """
+        X_seq = []
+        y_seq = []
+        
+        for i in range(len(X) - self.sequence_length):
+            X_seq.append(X[i:i+self.sequence_length])
+            y_seq.append(y[i+self.sequence_length])
+        
+        return np.array(X_seq), np.array(y_seq)
+    
+    def predict(self, X: pd.DataFrame) -> pd.Series:
+        """Make predictions with LSTM model.
+        
+        Args:
+            X: Feature DataFrame
+            
+        Returns:
+            Series of predictions
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before prediction")
+        
+        if hasattr(self, "_fallback_model"):
+            return self._fallback_model.predict(X)
+        
+        if not HAS_TORCH or self._model is None:
+            raise RuntimeError("PyTorch not available for LSTM prediction")
+        
+        self._model.eval()
+        with torch.no_grad():
+            X_values = X.values
+            if len(X_values) < self.sequence_length:
+                # Pad if not enough data
+                pad_len = self.sequence_length - len(X_values)
+                X_padded = np.pad(X_values, ((pad_len, 0), (0, 0)), mode='edge')
+                X_seq = X_padded.reshape(1, self.sequence_length, -1)
+            else:
+                X_seq = X_values[-self.sequence_length:].reshape(1, self.sequence_length, -1)
+            
+            X_tensor = torch.tensor(X_seq, dtype=torch.float32).to(self._device)
+            prediction = self._model(X_tensor).cpu().numpy()
+        
+        return pd.Series(prediction, index=X.index[-1:] if len(X) > 0 else X.index)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        """LSTM feature importance is not directly available, return empty."""
+        return {}
 
 
 class EnsembleModel(BaseModel):
@@ -650,6 +871,13 @@ class EnsembleModel(BaseModel):
         
         self.is_fitted = True
         self.training_time_ = time.time() - start_time
+        
+        # Check ensemble training time threshold (30min)
+        if self.training_time_ > TRAINING_TIME_THRESHOLD_SECONDS:
+            logger.warning(
+                f"Ensemble training time {self.training_time_:.2f}s exceeds "
+                f"threshold {TRAINING_TIME_THRESHOLD_SECONDS}s"
+            )
         
         return self
     
@@ -932,13 +1160,15 @@ class WalkForwardCV:
                 logger.warning(f"Split validation failed: {e}")
                 continue
         
+        oos_r2_mean = np.mean(oos_r2_scores) if oos_r2_scores else np.nan
         return {
-            "oos_r2_mean": np.mean(oos_r2_scores) if oos_r2_scores else np.nan,
+            "oos_r2_mean": oos_r2_mean,
             "oos_r2_std": np.std(oos_r2_scores) if oos_r2_scores else np.nan,
             "ic_mean": np.mean(oos_ic_scores) if oos_ic_scores else np.nan,
             "ic_std": np.std(oos_ic_scores) if oos_ic_scores else np.nan,
             "num_splits": len(oos_r2_scores),
-            "pct_positive_r2": (np.array(oos_r2_scores) > 0).mean() if oos_r2_scores else np.nan
+            "pct_positive_r2": (np.array(oos_r2_scores) > 0).mean() if oos_r2_scores else np.nan,
+            "oos_r2_meets_threshold": bool(oos_r2_mean > 0.05) if not np.isnan(oos_r2_mean) else False
         }
     
     def _clone_model(self, model: BaseModel) -> BaseModel:
@@ -1156,6 +1386,13 @@ class ReturnForecaster:
             RandomForestModel(n_estimators=50, random_state=42),
             XGBoostModel(n_estimators=50, random_state=42, verbosity=0)
         ]
+        # Add LSTM model if PyTorch is available
+        if HAS_TORCH:
+            try:
+                self.base_models.append(LSTMModel(random_state=42))
+                logger.info("LSTM model added to base models")
+            except Exception as e:
+                logger.warning(f"Failed to initialize LSTM model: {e}")
         
         # Initialize ensemble
         self.ensemble = EnsembleModel()
@@ -1273,58 +1510,79 @@ class ReturnForecaster:
         y: pd.Series,
         n_cv_folds: int = 5
     ) -> Dict[str, Any]:
-        """Validate ensemble out-of-sample.
+        """Validate ensemble out-of-sample using walk-forward validation.
         
         Args:
-            X: Feature DataFrame
-            y: Target Series
-            n_cv_folds: Number of CV folds
+            X: Feature DataFrame (should have datetime index for walk-forward)
+            y: Target Series (should have datetime index matching X)
+            n_cv_folds: Number of CV folds (unused if walk-forward is used)
             
         Returns:
-            Dict with validation metrics
+            Dict with validation metrics including R² > 0.05 threshold check
         """
-        if KFold is None:
-            raise RuntimeError("sklearn required for cross-validation")
-        
-        kf = KFold(n_splits=n_cv_folds, shuffle=True, random_state=42)
-        
-        oos_r2_scores = []
-        oos_ic_scores = []
-        
-        for train_idx, val_idx in kf.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        # Use walk-forward validation if X has datetime index
+        if isinstance(X.index, pd.DatetimeIndex) and isinstance(y.index, pd.DatetimeIndex):
+            # Prepare factor_data and return_data as DataFrames with datetime index
+            factor_data = X.copy()
+            return_data = pd.DataFrame(y).T if y.ndim == 1 else y.copy()
+            # Align return data to match factor data shape
+            return_data = return_data.reindex(factor_data.index, method='ffill')
             
-            # Train ensemble on this fold
-            ensemble = EnsembleModel()
-            for model in self.base_models:
-                model_copy = self._clone_model(model)
-                ensemble.add_model(model_copy)
+            results = self.validation.run_validation(
+                factor_data=factor_data,
+                return_data=return_data,
+                model=self.ensemble,
+                target_horizon_days=20
+            )
+            # Add threshold check
+            results["oos_r2_meets_threshold"] = bool(results.get("oos_r2_mean", np.nan) > 0.05) if not np.isnan(results.get("oos_r2_mean", np.nan)) else False
+            return results
+        else:
+            # Fallback to standard CV if no datetime index
+            if KFold is None:
+                raise RuntimeError("sklearn required for cross-validation")
             
-            ensemble.fit(X_train, y_train, use_cv_for_weights=True, n_cv_folds=3)
+            kf = KFold(n_splits=n_cv_folds, shuffle=True, random_state=42)
             
-            # Predict
-            predictions = ensemble.predict(X_val)
+            oos_r2_scores = []
+            oos_ic_scores = []
             
-            # Calculate R2
-            ss_res = ((y_val - predictions) ** 2).sum()
-            ss_tot = ((y_val - y_val.mean()) ** 2).sum()
-            r2 = 1 - (ss_res / (ss_tot + 1e-8))
-            oos_r2_scores.append(r2)
+            for train_idx, val_idx in kf.split(X):
+                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+                
+                # Train ensemble on this fold
+                ensemble = EnsembleModel()
+                for model in self.base_models:
+                    model_copy = self._clone_model(model)
+                    ensemble.add_model(model_copy)
+                
+                ensemble.fit(X_train, y_train, use_cv_for_weights=True, n_cv_folds=3)
+                
+                # Predict
+                predictions = ensemble.predict(X_val)
+                
+                # Calculate R2
+                ss_res = ((y_val - predictions) ** 2).sum()
+                ss_tot = ((y_val - y_val.mean()) ** 2).sum()
+                r2 = 1 - (ss_res / (ss_tot + 1e-8))
+                oos_r2_scores.append(r2)
+                
+                # Calculate IC
+                ic = predictions.corr(y_val)
+                if not np.isnan(ic):
+                    oos_ic_scores.append(ic)
             
-            # Calculate IC
-            ic = predictions.corr(y_val)
-            if not np.isnan(ic):
-                oos_ic_scores.append(ic)
-        
-        return {
-            "oos_r2_mean": np.mean(oos_r2_scores),
-            "oos_r2_std": np.std(oos_r2_scores),
-            "ic_mean": np.mean(oos_ic_scores) if oos_ic_scores else np.nan,
-            "ic_std": np.std(oos_ic_scores) if oos_ic_scores else np.nan,
-            "num_splits": n_cv_folds,
-            "pct_positive_r2": (np.array(oos_r2_scores) > 0).mean()
-        }
+            oos_r2_mean = np.mean(oos_r2_scores) if oos_r2_scores else np.nan
+            return {
+                "oos_r2_mean": oos_r2_mean,
+                "oos_r2_std": np.std(oos_r2_scores) if oos_r2_scores else np.nan,
+                "ic_mean": np.mean(oos_ic_scores) if oos_ic_scores else np.nan,
+                "ic_std": np.std(oos_ic_scores) if oos_ic_scores else np.nan,
+                "num_splits": n_cv_folds,
+                "pct_positive_r2": (np.array(oos_r2_scores) > 0).mean() if oos_r2_scores else np.nan,
+                "oos_r2_meets_threshold": bool(oos_r2_mean > 0.05) if not np.isnan(oos_r2_mean) else False
+            }
     
     def forecast_for_date(
         self,

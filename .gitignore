@@ -6,4 +6,4 @@ __pycache__
 .qoder
 .understand-anything
 .vscode
-.data_pipeline.log
+data_pipeline.log

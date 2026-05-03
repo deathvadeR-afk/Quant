@@ -119,6 +119,11 @@ class AnomalyDetector:
         Returns:
             self for method chaining
         """
+        # Handle empty DataFrames gracefully
+        if data.empty or len(data.columns) == 0:
+            logger.warning("Cannot fit anomaly detector on empty DataFrame")
+            return self
+        
         self._ensure_model()
         self._feature_names = list(data.columns)
         
@@ -140,16 +145,21 @@ class AnomalyDetector:
         Returns:
             Array of predictions: -1 for anomaly, 1 for normal
         """
-        self._ensure_model()
-        
         # Handle missing values
         data_clean = data.fillna(data.median() if hasattr(data, 'median') else 0)
         
+        # Check if model exists and is fitted
         if self._model is None:
             # Fallback: use simple z-score based detection
             return self._fallback_predict(data_clean)
         
-        return self._model.predict(data_clean)
+        # Check if model is fitted by trying to predict
+        try:
+            return self._model.predict(data_clean)
+        except (AttributeError, ValueError):
+            # Model not fitted, use fallback
+            logger.warning("Isolation Forest model not fitted, using fallback detection")
+            return self._fallback_predict(data_clean)
     
     def _fallback_predict(self, data: pd.DataFrame) -> np.ndarray:
         """Fallback anomaly detection using z-scores."""
@@ -174,10 +184,9 @@ class AnomalyDetector:
         Returns:
             Array of anomaly scores (lower = more anomalous)
         """
-        self._ensure_model()
-        
         data_clean = data.fillna(data.median() if hasattr(data, 'median') else 0)
         
+        # Check if model exists
         if self._model is None:
             # Fallback: use negative of z-score magnitude
             from scipy import stats
@@ -190,7 +199,21 @@ class AnomalyDetector:
                 return np.mean(scores, axis=0)
             return np.zeros(len(data_clean))
         
-        return self._model.score_samples(data_clean)
+        # Check if model is fitted by trying to score
+        try:
+            return self._model.score_samples(data_clean)
+        except (AttributeError, ValueError):
+            # Model not fitted, use fallback
+            logger.warning("Isolation Forest model not fitted, using fallback scoring")
+            from scipy import stats
+            scores = []
+            for col in data_clean.columns:
+                if data_clean[col].dtype in [np.float64, np.int64]:
+                    z = np.abs(stats.zscore(data_clean[col], nan_policy='omit'))
+                    scores.append(-z)
+            if scores:
+                return np.mean(scores, axis=0)
+            return np.zeros(len(data_clean))
     
     def detect_anomalies_in_metrics(
         self, metrics: Dict[str, Any]
@@ -426,19 +449,46 @@ class ReportGenerator:
         self._llm_client = None
     
     def _get_llm_client(self):
-        """Get or initialize LLM client for NVIDIA NIM."""
+        """
+        Get or initialize LLM client for NVIDIA NIM.
+        
+        Returns:
+            Dictionary with API configuration or None if not available
+        """
         if self._llm_client is None and self.use_llm:
             try:
-                # Try to get NVIDIA NIM client from config
                 import os
+                import requests
+                
                 api_key = os.environ.get("NVIDIA_NIM_API_KEY")
-                if api_key:
-                    # In production, initialize NVIDIA NIM client here
-                    # from nvidia_nim import ChatCompletions
-                    # self._llm_client = ChatCompletions(api_key=api_key)
-                    pass
+                if not api_key:
+                    logger.warning("NVIDIA_NIM_API_KEY not found in environment variables")
+                    return None
+                
+                # NVIDIA NIM API configuration for Gemma 4
+                self._llm_client = {
+                    "api_key": api_key,
+                    "endpoint": "https://integrate.api.nvidia.com/v1/chat/completions",
+                    "model": "google/gemma-4-27b-it",  # Gemma 4 model on NVIDIA NIM
+                    "session": requests.Session()
+                }
+                
+                # Test connection with a simple request
+                test_response = self._llm_client["session"].get(
+                    "https://integrate.api.nvidia.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=5
+                )
+                if test_response.status_code != 200:
+                    logger.warning(f"NVIDIA NIM API test failed: {test_response.status_code}")
+                    self._llm_client = None
+                else:
+                    logger.info("NVIDIA NIM client initialized successfully for Gemma 4")
+                    
             except Exception as e:
                 logger.warning(f"Failed to initialize LLM client: {e}")
+                self._llm_client = None
+        
         return self._llm_client
     
     def _create_report_prompt(self, quality_data: Dict[str, Any]) -> str:
@@ -502,10 +552,106 @@ Provide a concise summary and 3-5 actionable recommendations to improve data qua
         return self._generate_template_report(quality_data)
     
     def _generate_llm_report(self, quality_data: Dict[str, Any]) -> QualityReport:
-        """Generate report using LLM."""
-        # This would call NVIDIA NIM API in production
-        # For now, fall back to template
-        return self._generate_template_report(quality_data)
+        """
+        Generate report using Gemma 4 via NVIDIA NIM API.
+        
+        Args:
+            quality_data: Dictionary containing quality metrics
+            
+        Returns:
+            QualityReport instance with LLM-generated content
+        """
+        client = self._get_llm_client()
+        if not client:
+            raise ValueError("LLM client not available")
+        
+        prompt = self._create_report_prompt(quality_data)
+        
+        try:
+            # Prepare the request payload for NVIDIA NIM API
+            payload = {
+                "model": client["model"],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a data quality analyst for a quantitative trading system. Provide concise, actionable insights."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 500,
+                "top_p": 0.9
+            }
+            
+            # Make API call to NVIDIA NIM
+            response = client["session"].post(
+                client["endpoint"],
+                headers={
+                    "Authorization": f"Bearer {client['api_key']}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=30  # 30 second timeout for report generation
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract generated text from response
+            if "choices" in result and len(result["choices"]) > 0:
+                generated_text = result["choices"][0]["message"]["content"]
+                
+                # Parse the generated text to extract summary and recommendations
+                lines = generated_text.strip().split("\n")
+                summary = ""
+                recommendations = []
+                
+                current_section = "summary"
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    if "recommendation" in line.lower() or "action" in line.lower():
+                        current_section = "recommendations"
+                        continue
+                    
+                    if current_section == "summary" and len(summary) < 300:
+                        summary += line + " "
+                    elif current_section == "recommendations":
+                        # Clean up bullet points or numbers
+                        clean_line = line.lstrip("•-*1234567890. ")
+                        if clean_line and len(recommendations) < 5:
+                            recommendations.append(clean_line)
+                
+                # Fallback if parsing failed
+                if not summary:
+                    summary = generated_text[:300]
+                if not recommendations:
+                    recommendations = [
+                        "Review data pipeline logs for errors",
+                        "Check data source API status",
+                        "Validate data transformation logic"
+                    ]
+                
+                return QualityReport(
+                    timestamp=datetime.now(),
+                    quality_score=quality_data.get("quality_score", 0),
+                    issues_found=len(quality_data.get("issues", [])),
+                    anomalies_detected=len(quality_data.get("anomalies", [])),
+                    summary=summary.strip(),
+                    details=quality_data,
+                    recommendations=recommendations[:5]
+                )
+            else:
+                raise ValueError("Invalid response format from NVIDIA NIM API")
+                
+        except Exception as e:
+            logger.error(f"NVIDIA NIM API call failed: {e}")
+            raise  # Re-raise to trigger fallback in generate_report()
     
     def _generate_template_report(self, quality_data: Dict[str, Any]) -> QualityReport:
         """Generate report using templates (fallback)."""

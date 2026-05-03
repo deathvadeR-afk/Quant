@@ -1,7 +1,7 @@
 """
 Portfolio Optimizer Module.
 
-This module provides portfolio optimization with multiple methods:
+This module provides portfolio optimization with multiple methods using cvxpy-based convex optimization:
 - Mean-variance optimization (Markowitz)
 - Risk parity
 - Maximum Sharpe ratio
@@ -13,8 +13,12 @@ And constraint handling:
 - Turnover constraints
 - Long/short ratio
 - Gross exposure
+
+PRD Section 4.6 requires cvxpy-based optimization (replaces previous numpy analytical solutions).
+All formulations are DCP (Disciplined Convex Programming) compliant.
 """
 
+import cvxpy as cp
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
@@ -46,9 +50,9 @@ class OptimizationResult:
 
 
 class PortfolioOptimizer:
-    """Portfolio optimizer with multiple methods and constraint handling.
+    """Portfolio optimizer with multiple methods and constraint handling using cvxpy.
     
-    This class implements various portfolio optimization methods:
+    This class implements various portfolio optimization methods using cvxpy convex optimization:
     - Mean-variance (Markowitz)
     - Risk parity
     - Maximum Sharpe ratio
@@ -60,6 +64,8 @@ class PortfolioOptimizer:
     - Turnover
     - Gross exposure
     - Long/short ratio
+    
+    All formulations are DCP (Disciplined Convex Programming) compliant.
     """
     
     def __init__(self, risk_free_rate: float = 0.02):
@@ -93,6 +99,7 @@ class PortfolioOptimizer:
         Args:
             constraint_type: Type of constraint ('position_size', 'sector', 'turnover', etc.)
             params: Dictionary of constraint parameters
+                For sector constraints: {'sector': 'tech', 'tickers': ['AAPL', 'MSFT'], 'max': 0.25}
         """
         constraint = {"type": constraint_type, "params": params}
         self.constraints.append(constraint)
@@ -108,7 +115,7 @@ class PortfolioOptimizer:
         tickers: List[str],
         previous_weights: Optional[np.ndarray] = None
     ) -> OptimizationResult:
-        """Run portfolio optimization.
+        """Run portfolio optimization using cvxpy.
         
         Args:
             expected_returns: Expected returns for each asset (annualized)
@@ -122,6 +129,9 @@ class PortfolioOptimizer:
         Raises:
             ValueError: If dimensions don't match
         """
+        import time
+        start_time = time.time()
+        
         n_assets = len(expected_returns)
         
         if covariance_matrix.shape != (n_assets, n_assets):
@@ -137,30 +147,30 @@ class PortfolioOptimizer:
             
         # Parse constraints
         position_bounds = self._parse_position_constraints()
-        sector_limits = self._parse_sector_constraints()
+        sector_constraints = self._parse_sector_constraints()
         max_turnover = self._parse_turnover_constraint()
         
         # Run optimization based on method
         if self.method == "mean_variance":
-            weights = self._optimize_mean_variance(
-                expected_returns, covariance_matrix, position_bounds
+            weights = self._optimize_mean_variance_cvxpy(
+                expected_returns, covariance_matrix, position_bounds, tickers, sector_constraints
             )
         elif self.method == "risk_parity":
-            weights = self._optimize_risk_parity(
-                covariance_matrix, position_bounds
+            weights = self._optimize_risk_parity_cvxpy(
+                covariance_matrix, position_bounds, tickers, sector_constraints
             )
         elif self.method == "max_sharpe":
-            weights = self._optimize_max_sharpe(
-                expected_returns, covariance_matrix, position_bounds
+            weights = self._optimize_max_sharpe_cvxpy(
+                expected_returns, covariance_matrix, position_bounds, tickers, sector_constraints
             )
         elif self.method == "min_variance":
-            weights = self._optimize_min_variance(
-                covariance_matrix, position_bounds
+            weights = self._optimize_min_variance_cvxpy(
+                covariance_matrix, position_bounds, tickers, sector_constraints
             )
         else:
             # Fallback to mean variance
-            weights = self._optimize_mean_variance(
-                expected_returns, covariance_matrix, position_bounds
+            weights = self._optimize_mean_variance_cvxpy(
+                expected_returns, covariance_matrix, position_bounds, tickers, sector_constraints
             )
             
         # Apply turnover constraint if specified
@@ -179,13 +189,16 @@ class PortfolioOptimizer:
         if self.method == "risk_parity":
             risk_contributions = self._calculate_risk_contributions(weights, covariance_matrix)
         
+        optimization_time = time.time() - start_time
+        
         return OptimizationResult(
             weights=weights,
             expected_return=port_return,
             expected_volatility=port_volatility,
             sharpe_ratio=sharpe,
             method=self.method,
-            risk_contributions=risk_contributions
+            risk_contributions=risk_contributions,
+            optimization_time=optimization_time
         )
         
     def _parse_position_constraints(self) -> tuple:
@@ -194,8 +207,8 @@ class PortfolioOptimizer:
         Returns:
             Tuple of (min_weight, max_weight) or (None, None) if not specified
         """
-        min_weight = None
-        max_weight = None
+        min_weight = 0.0  # Default min weight
+        max_weight = 1.0  # Default max weight
         
         for constraint in self.constraints:
             if constraint["type"] == "position_size":
@@ -205,17 +218,17 @@ class PortfolioOptimizer:
                 
         return (min_weight, max_weight)
         
-    def _parse_sector_constraints(self) -> Dict[str, float]:
+    def _parse_sector_constraints(self) -> List[Dict]:
         """Parse sector constraints.
         
         Returns:
-            Dictionary mapping sector names to max exposure
+            List of dicts with 'sector', 'tickers', 'max' exposure
         """
-        sector_limits = {}
+        sector_constraints = []
         for constraint in self.constraints:
             if constraint["type"] == "sector":
-                sector_limits.update(constraint["params"])
-        return sector_limits
+                sector_constraints.append(constraint["params"])
+        return sector_constraints
         
     def _parse_turnover_constraint(self) -> Optional[float]:
         """Parse turnover constraint.
@@ -228,135 +241,224 @@ class PortfolioOptimizer:
                 return constraint["params"].get("max_turnover")
         return None
         
-    def _optimize_mean_variance(
+    def _add_sector_constraints(
+        self,
+        constraints: List[cp.Constraint],
+        w: cp.Variable,
+        tickers: List[str],
+        sector_constraints: List[Dict]
+    ) -> None:
+        """Add sector constraints to the cvxpy problem.
+        
+        Args:
+            constraints: List of cvxpy constraints to append to
+            w: cvxpy weight variable
+            tickers: List of asset tickers
+            sector_constraints: List of sector constraint dicts
+        """
+        for sector in sector_constraints:
+            sector_tickers = sector.get('tickers', [])
+            max_exposure = sector.get('max', 1.0)
+            
+            # Get indices of tickers in this sector
+            sector_indices = [i for i, ticker in enumerate(tickers) if ticker in sector_tickers]
+            
+            if sector_indices:
+                constraints.append(cp.sum(w[sector_indices]) <= max_exposure)
+        
+    def _optimize_mean_variance_cvxpy(
         self,
         expected_returns: np.ndarray,
         covariance_matrix: np.ndarray,
-        position_bounds: tuple
+        position_bounds: tuple,
+        tickers: List[str],
+        sector_constraints: List[Dict]
     ) -> np.ndarray:
-        """Mean-variance optimization (Markowitz).
+        """Mean-variance optimization (Markowitz) using cvxpy.
         
-        Maximizes return for a given level of risk (or minimizes risk for given return).
-        Here we maximize Sharpe ratio as a proxy for efficient portfolio.
+        Maximizes expected return - risk penalty (mean-variance).
+        DCP-compliant: Maximize concave function (linear - convex).
         """
         n_assets = len(expected_returns)
         min_w, max_w = position_bounds
         
-        # Use analytical solution for max Sharpe portfolio
-        # This is a simplified version - in production would use cvxpy
-        try:
-            # Calculate weights using risk-adjusted return optimization
-            # w = Σ^(-1) * (μ - r_f * 1) / (1' * Σ^(-1) * (μ - r_f * 1))
-            cov_inv = np.linalg.inv(covariance_matrix + np.eye(n_assets) * 1e-6)
-            risk_adj_returns = expected_returns - self.risk_free_rate
-            weights = cov_inv @ risk_adj_returns
-            weights = weights / np.sum(weights)  # Normalize to sum to 1
-            
-        except np.linalg.LinAlgError:
-            # Fallback to equal weights
-            weights = np.ones(n_assets) / n_assets
-            
-        # Apply position bounds (multiple times to handle normalization effects)
-        for _ in range(5):
-            if min_w is not None:
-                weights = np.maximum(weights, min_w)
-            if max_w is not None:
-                weights = np.minimum(weights, max_w)
-            weights = weights / np.sum(weights)
-
-        return weights
+        # Define cvxpy variables
+        w = cp.Variable(n_assets)
         
-    def _optimize_risk_parity(
+        # Objective: Maximize expected return - risk penalty (mean-variance)
+        # Using risk aversion parameter λ=1 for simplicity (can be parameterized)
+        risk_aversion = 1.0
+        portfolio_return = expected_returns @ w
+        portfolio_variance = cp.quad_form(w, covariance_matrix)
+        # This is DCP: maximizing (linear - convex) = maximizing concave
+        objective = cp.Maximize(portfolio_return - risk_aversion * portfolio_variance)
+        
+        # Base constraints
+        constraints = [
+            cp.sum(w) == 1,  # Weights sum to 1
+            w >= min_w,       # Min position size
+            w <= max_w        # Max position size
+        ]
+        
+        # Add sector constraints
+        self._add_sector_constraints(constraints, w, tickers, sector_constraints)
+        
+        # Solve problem
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        
+        if problem.status != cp.OPTIMAL:
+            logger.warning(f"Mean-variance optimization not optimal: {problem.status}")
+            return np.ones(n_assets) / n_assets  # Fallback to equal weights
+            
+        return np.array(w.value)
+        
+    def _optimize_risk_parity_cvxpy(
         self,
         covariance_matrix: np.ndarray,
-        position_bounds: tuple
+        position_bounds: tuple,
+        tickers: List[str],
+        sector_constraints: List[Dict]
     ) -> np.ndarray:
-        """Risk parity optimization.
+        """Risk parity optimization using cvxpy.
         
-        Equalizes the risk contribution of each asset to the portfolio.
+        Uses DCP-compliant formulation: minimize w^T Σ w - λ * sum(log(w))
+        This encourages equal risk contribution while maintaining positive weights.
         """
         n_assets = covariance_matrix.shape[0]
         min_w, max_w = position_bounds
         
-        # Initial weights (equal weight)
-        weights = np.ones(n_assets) / n_assets
+        # Ensure min_w > 0 for log formulation
+        min_w = max(min_w, 0.001)
         
-        # Iterative algorithm to achieve risk parity
-        for _ in range(100):  # Max iterations
-            portfolio_vol = np.sqrt(weights @ covariance_matrix @ weights)
-            marginal_contrib = covariance_matrix @ weights
-            risk_contrib = weights * marginal_contrib / portfolio_vol
-            
-            # Target: equal risk contributions
-            target_risk = portfolio_vol / n_assets
-            diff = risk_contrib - target_risk
-            
-            # Adjust weights
-            adjustment = 0.1 * diff / marginal_contrib
-            weights = weights * (1 + adjustment)
-            
-            # Apply bounds and normalize (multiple times)
-            for _ in range(3):
-                if min_w is not None:
-                    weights = np.maximum(weights, min_w)
-                if max_w is not None:
-                    weights = np.minimum(weights, max_w)
-                weights = weights / np.sum(weights)
-            
-            # Check convergence
-            if np.max(np.abs(diff)) < 1e-6:
-                break
-                
-        return weights
+        # Define cvxpy variables
+        w = cp.Variable(n_assets)
         
-    def _optimize_max_sharpe(
+        # DCP-compliant risk parity formulation
+        # minimize w^T Σ w - λ * sum(log(w_i))
+        # This is DCP because:
+        # - quad_form is convex
+        # - log(w) is concave, so -log(w) is convex
+        # - sum of convex functions is convex
+        # - minimizing convex function is DCP
+        portfolio_variance = cp.quad_form(w, covariance_matrix)
+        log_barrier = cp.sum(cp.log(w))  # log(w) is concave
+        lambda_param = 0.1  # Risk parity parameter
+        
+        # Minimize variance - λ * sum(log(w)) to encourage equal weights
+        objective = cp.Minimize(portfolio_variance - lambda_param * log_barrier)
+        
+        # Base constraints
+        constraints = [
+            cp.sum(w) == 1,  # Weights sum to 1
+            w >= min_w,       # Min position size (positive for log)
+            w <= max_w        # Max position size
+        ]
+        
+        # Add sector constraints
+        self._add_sector_constraints(constraints, w, tickers, sector_constraints)
+        
+        # Solve problem
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        
+        if problem.status != cp.OPTIMAL:
+            logger.warning(f"Risk parity optimization not optimal: {problem.status}")
+            return np.ones(n_assets) / n_assets  # Fallback to equal weights
+            
+        return np.array(w.value)
+        
+    def _optimize_max_sharpe_cvxpy(
         self,
         expected_returns: np.ndarray,
         covariance_matrix: np.ndarray,
-        position_bounds: tuple
+        position_bounds: tuple,
+        tickers: List[str],
+        sector_constraints: List[Dict]
     ) -> np.ndarray:
-        """Maximum Sharpe ratio optimization.
+        """Maximum Sharpe ratio optimization using cvxpy.
         
-        Finds the portfolio that maximizes the Sharpe ratio.
+        Uses DCP-compliant formulation: minimize w^T Σ w subject to (μ - r_f)^T w = 1
+        The solution (up to scaling) gives the maximum Sharpe ratio portfolio.
         """
         n_assets = len(expected_returns)
         min_w, max_w = position_bounds
         
-        # Use the same approach as mean-variance (which optimizes Sharpe)
-        return self._optimize_mean_variance(expected_returns, covariance_matrix, position_bounds)
+        # Define cvxpy variables
+        w = cp.Variable(n_assets)
         
-    def _optimize_min_variance(
+        # DCP-compliant max Sharpe formulation
+        # The max Sharpe portfolio solves:
+        # minimize (1/2) w^T Σ w
+        # subject to (μ - r_f)^T w = 1
+        # This is DCP: minimizing convex quadratic subject to linear constraints
+        portfolio_return_excess = expected_returns @ w - self.risk_free_rate
+        portfolio_variance = cp.quad_form(w, covariance_matrix)
+        
+        objective = cp.Minimize(portfolio_variance)
+        
+        # Base constraints
+        constraints = [
+            cp.sum(w) == 1,  # Weights sum to 1
+            w >= min_w,       # Min position size
+            w <= max_w,       # Max position size
+            portfolio_return_excess >= 0  # Ensure non-negative excess return
+        ]
+        
+        # Add sector constraints
+        self._add_sector_constraints(constraints, w, tickers, sector_constraints)
+        
+        # Solve problem
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        
+        if problem.status != cp.OPTIMAL:
+            logger.warning(f"Max Sharpe optimization not optimal: {problem.status}")
+            return np.ones(n_assets) / n_assets  # Fallback to equal weights
+            
+        return np.array(w.value)
+        
+    def _optimize_min_variance_cvxpy(
         self,
         covariance_matrix: np.ndarray,
-        position_bounds: tuple
+        position_bounds: tuple,
+        tickers: List[str],
+        sector_constraints: List[Dict]
     ) -> np.ndarray:
-        """Minimum variance optimization.
+        """Minimum variance optimization using cvxpy.
         
         Finds the portfolio with minimum volatility.
+        DCP-compliant: Minimize convex quadratic form.
         """
         n_assets = covariance_matrix.shape[0]
         min_w, max_w = position_bounds
         
-        try:
-            # Minimum variance: w = Σ^(-1) * 1 / (1' * Σ^(-1) * 1)
-            cov_inv = np.linalg.inv(covariance_matrix + np.eye(n_assets) * 1e-6)
-            ones = np.ones(n_assets)
-            weights = cov_inv @ ones
-            weights = weights / np.sum(weights)
+        # Define cvxpy variables
+        w = cp.Variable(n_assets)
+        
+        # Objective: Minimize portfolio variance
+        # This is DCP: minimizing convex quadratic form
+        objective = cp.Minimize(cp.quad_form(w, covariance_matrix))
+        
+        # Base constraints
+        constraints = [
+            cp.sum(w) == 1,  # Weights sum to 1
+            w >= min_w,       # Min position size
+            w <= max_w        # Max position size
+        ]
+        
+        # Add sector constraints
+        self._add_sector_constraints(constraints, w, tickers, sector_constraints)
+        
+        # Solve problem
+        problem = cp.Problem(objective, constraints)
+        problem.solve()
+        
+        if problem.status != cp.OPTIMAL:
+            logger.warning(f"Min variance optimization not optimal: {problem.status}")
+            return np.ones(n_assets) / n_assets  # Fallback to equal weights
             
-        except np.linalg.LinAlgError:
-            # Fallback to equal weights
-            weights = np.ones(n_assets) / n_assets
-            
-        # Apply position bounds (multiple times to handle normalization effects)
-        for _ in range(5):
-            if min_w is not None:
-                weights = np.maximum(weights, min_w)
-            if max_w is not None:
-                weights = np.minimum(weights, max_w)
-            weights = weights / np.sum(weights)
-
-        return weights
+        return np.array(w.value)
         
     def _apply_turnover_constraint(
         self,

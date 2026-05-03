@@ -553,6 +553,34 @@ class TestStreaming:
             
             assert len(states) > 0
 
+    def test_streaming_support(self):
+        """Streaming functionality works and returns correct output format."""
+        from graph.trading_graph import compile_trading_graph
+        from graph.state import TradingState, AgentStatus
+        
+        graph = compile_trading_graph()
+        initial_state = TradingState(
+            date="2024-01-15",
+            current_agent="data_guardian",
+            agent_status=AgentStatus.IDLE,
+        )
+        
+        with patch('tools.registry.get_default_registry') as mock_registry:
+            mock_tool = MagicMock()
+            mock_tool.invoke.return_value = {
+                "success": True,
+                "data": {"quality_score": 0.95, "issues": []},
+            }
+            mock_registry.return_value.get_tool.return_value = mock_tool
+            
+            # Stream and collect states
+            stream_states = list(graph.stream(initial_state, stream_mode="values"))
+            
+            assert len(stream_states) > 0, "Stream produced no states"
+            # Each state should be a dict or TradingState
+            for state in stream_states:
+                assert isinstance(state, dict) or hasattr(state, 'current_agent')
+
 
 # Performance tests
 class TestPerformance:
@@ -620,6 +648,64 @@ class TestPerformance:
         elapsed_ms = (time.time() - start) * 1000
         
         assert elapsed_ms < 100, f"Deserialization took {elapsed_ms}ms, expected < 100ms"
+
+    def test_graph_execution_time(self):
+        """Graph execution completes in under 2 hours (7200 seconds)."""
+        import time
+        from graph.trading_graph import compile_trading_graph
+        from graph.state import TradingState, AgentStatus
+        
+        graph = compile_trading_graph()
+        initial_state = TradingState(
+            date="2024-01-15",
+            current_agent="data_guardian",
+            agent_status=AgentStatus.IDLE,
+        )
+        
+        # Mock all tool invocations to avoid real API calls
+        with patch('tools.registry.get_default_registry') as mock_registry:
+            mock_tool = MagicMock()
+            mock_tool.invoke.return_value = {
+                "success": True,
+                "data": {"quality_score": 0.95, "issues": []},
+            }
+            mock_registry.return_value.get_tool.return_value = mock_tool
+            
+            start_time = time.time()
+            result = graph.invoke(initial_state)
+            elapsed = time.time() - start_time
+            
+            assert elapsed < 7200, f"Graph execution took {elapsed}s, expected <7200s (2h)"
+
+    def test_state_query_performance(self):
+        """State query (load_state) completes in under 100ms on average."""
+        import time
+        from graph.state_manager import RedisStateManager
+        from graph.state import TradingState, AgentStatus
+        
+        manager = RedisStateManager(host="localhost", port=6379, db=0)
+        state = TradingState(
+            date="2024-01-15",
+            current_agent="data_guardian",
+            agent_status=AgentStatus.IDLE,
+        )
+        
+        # Mock Redis client to avoid real Redis connection
+        with patch('redis.Redis') as mock_redis:
+            mock_client = MagicMock()
+            mock_redis.return_value = mock_client
+            # Mock load_state to return the state quickly
+            mock_client.get.return_value = state.model_dump_json().encode()
+            
+            num_queries = 100
+            total_time = 0.0
+            for _ in range(num_queries):
+                start = time.time()
+                manager.load_state("test_cycle")
+                total_time += time.time() - start
+            
+            avg_ms = (total_time / num_queries) * 1000
+            assert avg_ms < 100, f"Average query time {avg_ms}ms, expected <100ms"
 
 
 if __name__ == "__main__":

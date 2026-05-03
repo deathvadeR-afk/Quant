@@ -276,11 +276,12 @@ def run_daily_cycle_with_state_manager(
     
     graph = get_compiled_graph()
     
-    # Execute with state persistence
-    # Note: In production, you'd want to save state after each node
-    result = graph.invoke(initial_state)
-    
-    # Save final state
-    state_manager.save_state(cycle_id, result)
+    # Execute with per-node state persistence
+    final_state = initial_state
+    for step_state in graph.stream(initial_state, stream_mode="values"):
+        final_state = step_state
+        # Save state after each node completes
+        state_manager.save_state(cycle_id, final_state)
+    result = final_state
 
     return result

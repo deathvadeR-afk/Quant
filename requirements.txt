@@ -41,6 +41,9 @@ nbformat>=5.10.0
 pytest>=8.0.0
 pytest-cov>=4.1.0
 
+# State Management
+redis>=5.0.0
+
 # Agent & LLM Integration (for tools module)
 langchain>=0.1.0
 langchain-core>=0.1.0

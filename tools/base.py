@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ToolConfig:
     """Configuration for tool execution."""
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 5.0
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
     enable_caching: bool = True

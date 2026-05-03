@@ -8,7 +8,7 @@ This module defines the SQLite database schema for storing:
 """
 
 import sqlite3
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import pandas as pd
 
 
@@ -277,6 +277,50 @@ def get_universe_data_status(db_path: str) -> Dict:
         'price_complete': row[4] or 0,
         'fundamental_complete': row[5] or 0
     }
+
+
+def get_portfolio_exposure(db_path: str) -> Dict[str, Any]:
+    """
+    Get portfolio sector and industry exposure breakdown.
+    
+    Args:
+        db_path: Path to the SQLite database file
+        
+    Returns:
+        Dictionary with sector_exposure (list of sector records) and top_industries (list of industry records)
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        # Query sector exposure
+        sector_query = """
+            SELECT sector, COUNT(*) as count,
+                   SUM(market_cap) as total_market_cap
+            FROM selected_universe
+            WHERE sector IS NOT NULL
+            GROUP BY sector
+            ORDER BY total_market_cap DESC
+        """
+        sector_df = pd.read_sql_query(sector_query, conn)
+        
+        # Query top 20 industries by count
+        industry_query = """
+            SELECT industry, COUNT(*) as count
+            FROM selected_universe
+            WHERE industry IS NOT NULL
+            GROUP BY industry
+            ORDER BY count DESC
+            LIMIT 20
+        """
+        industry_df = pd.read_sql_query(industry_query, conn)
+        
+        return {
+            "sector_exposure": sector_df.to_dict(orient="records") if not sector_df.empty else [],
+            "top_industries": industry_df.to_dict(orient="records") if not industry_df.empty else [],
+        }
+    except Exception as e:
+        return {"error": str(e), "sector_exposure": [], "top_industries": []}
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

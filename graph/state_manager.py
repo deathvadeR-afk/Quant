@@ -38,7 +38,7 @@ class RedisStateManager:
         password: Optional[str] = None,
         key_prefix: str = "trading_graph:",
         connection_timeout: float = 5.0,
-        operation_timeout: float = 1.0,
+        operation_timeout: float = 0.1,
     ):
         """
         Initialize Redis state manager.

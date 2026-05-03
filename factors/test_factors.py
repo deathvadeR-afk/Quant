@@ -210,6 +210,45 @@ class TestValueFactors:
         
         ev_ebitda = calc.calculate_ev_ebitda(test_data)
         assert ev_ebitda['AAPL'] == pytest.approx(25.0, rel=0.1)
+    
+    def test_dividend_yield_calculation(self, sample_fundamental_data):
+        """Test dividend yield calculation."""
+        from factors.calculator import ValueFactors
+        
+        calc = ValueFactors()
+        
+        # Add dividend_yield to the fundamental data
+        test_data = sample_fundamental_data.copy()
+        new_rows = [
+            {'ticker': 'AAPL', 'report_date': date(2024, 3, 31), 'metric': 'dividend_yield', 'value': 0.005},
+            {'ticker': 'MSFT', 'report_date': date(2024, 3, 31), 'metric': 'dividend_yield', 'value': 0.008},
+        ]
+        test_data = pd.concat([test_data, pd.DataFrame(new_rows)], ignore_index=True)
+        
+        dy = calc.calculate_dividend_yield(test_data)
+        assert 'AAPL' in dy.index
+        assert dy['AAPL'] == pytest.approx(0.005, rel=0.01)
+    
+    def test_price_to_fcf_calculation(self, sample_fundamental_data):
+        """Test Price to Free Cash Flow calculation."""
+        from factors.calculator import ValueFactors
+        
+        calc = ValueFactors()
+        
+        # Add price and free_cash_flow to the fundamental data
+        test_data = sample_fundamental_data.copy()
+        new_rows = [
+            {'ticker': 'AAPL', 'report_date': date(2024, 3, 31), 'metric': 'price', 'value': 180},
+            {'ticker': 'AAPL', 'report_date': date(2024, 3, 31), 'metric': 'free_cash_flow', 'value': 6.0},
+            {'ticker': 'MSFT', 'report_date': date(2024, 3, 31), 'metric': 'price', 'value': 400},
+            {'ticker': 'MSFT', 'report_date': date(2024, 3, 31), 'metric': 'free_cash_flow', 'value': 12.0},
+        ]
+        test_data = pd.concat([test_data, pd.DataFrame(new_rows)], ignore_index=True)
+        
+        ptfcf = calc.calculate_price_to_fcf(test_data)
+        assert 'AAPL' in ptfcf.index
+        # Price 180 / FCF 6.0 = 30.0
+        assert ptfcf['AAPL'] == pytest.approx(30.0, rel=0.1)
 
 
 class TestMomentumFactors:
@@ -258,6 +297,32 @@ class TestMomentumFactors:
         
         assert 'AAPL' in macd.index
         assert isinstance(macd['AAPL'], float)
+    
+    def test_6m_return_calculation(self, sample_price_data):
+        """Test 6-month return calculation."""
+        from factors.calculator import MomentumFactors
+        
+        calc = MomentumFactors()
+        # 6 months ≈ 126 trading days
+        returns = calc.calculate_cumulative_return(sample_price_data, window_days=126)
+        
+        assert 'AAPL' in returns.index
+        assert isinstance(returns['AAPL'], float)
+        # Return should be positive due to upward trend
+        assert returns['AAPL'] > 0
+    
+    def test_12m_return_calculation(self, sample_price_data):
+        """Test 12-month return calculation."""
+        from factors.calculator import MomentumFactors
+        
+        calc = MomentumFactors()
+        # 12 months ≈ 252 trading days
+        returns = calc.calculate_cumulative_return(sample_price_data, window_days=252)
+        
+        assert 'AAPL' in returns.index
+        assert isinstance(returns['AAPL'], float)
+        # Return should be positive due to upward trend
+        assert returns['AAPL'] > 0
 
 
 class TestQualityFactors:
@@ -292,6 +357,57 @@ class TestQualityFactors:
         
         assert 'AAPL' in de.index
         assert de['AAPL'] == pytest.approx(1.5, rel=0.01)
+    
+    def test_profit_margin_calculation(self, sample_fundamental_data):
+        """Test profit margin calculation."""
+        from factors.calculator import QualityFactors
+        
+        calc = QualityFactors()
+        
+        # Add profit_margin to the fundamental data
+        test_data = sample_fundamental_data.copy()
+        new_rows = [
+            {'ticker': 'AAPL', 'report_date': date(2024, 3, 31), 'metric': 'profit_margin', 'value': 0.28},
+            {'ticker': 'MSFT', 'report_date': date(2024, 3, 31), 'metric': 'profit_margin', 'value': 0.35},
+        ]
+        test_data = pd.concat([test_data, pd.DataFrame(new_rows)], ignore_index=True)
+        
+        pm = calc.calculate_profit_margin(test_data)
+        assert 'AAPL' in pm.index
+        assert pm['AAPL'] == pytest.approx(0.28, rel=0.01)
+    
+    def test_earnings_stability_calculation(self, sample_fundamental_data):
+        """Test earnings stability calculation."""
+        from factors.calculator import QualityFactors
+        
+        calc = QualityFactors()
+        
+        # Add earnings data (multiple periods for stability calculation)
+        test_data = sample_fundamental_data.copy()
+        earnings_rows = []
+        
+        # Define proper quarterly dates (avoiding invalid month 0)
+        quarterly_dates = [
+            date(2024, 3, 31),   # Q1 2024
+            date(2023, 12, 31),  # Q4 2023
+            date(2023, 9, 30),   # Q3 2023
+            date(2023, 6, 30),   # Q2 2023
+        ]
+        
+        for ticker in ['AAPL', 'MSFT', 'GOOGL']:
+            for q in range(4): # 4 quarters of data
+                earnings_rows.append({
+                    'ticker': ticker,
+                    'report_date': quarterly_dates[q],
+                    'metric': 'earnings',
+                    'value': 20e9 + q * 1e9 if ticker == 'AAPL' else 15e9 + q * 0.5e9
+                })
+        test_data = pd.concat([test_data, pd.DataFrame(earnings_rows)], ignore_index=True)
+        
+        stability = calc.calculate_earnings_stability(test_data)
+        assert 'AAPL' in stability.index
+        assert not np.isnan(stability['AAPL'])
+        assert 0 <= stability['AAPL'] <= 1  # Stability should be normalized to 0-1
 
 
 class TestVolatilityFactors:
@@ -439,6 +555,49 @@ class TestICCalculation:
         rank_ic = calculate_rank_ic(factors, returns)
         
         assert -1 <= rank_ic <= 1
+    
+    def test_walk_forward_ic_series(self):
+        """Test walk-forward IC series calculation."""
+        from factors.validation import calculate_ic_series
+        
+        # Create sample walk-forward data (dates -> factor/return series)
+        dates = pd.date_range('2024-01-01', periods=5, freq='ME')
+        
+        factor_data = {}
+        return_data = {}
+        
+        for i, d in enumerate(dates):
+            # Create factor and return data for each date
+            tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
+            factors = pd.Series(np.random.randn(5) + i * 0.1, index=tickers)
+            returns = pd.Series(np.random.randn(5) + i * 0.05, index=tickers)
+            
+            factor_data[d] = factors
+            return_data[d] = returns
+        
+        # Calculate IC series
+        ic_series = calculate_ic_series(factor_data, return_data)
+        
+        assert len(ic_series) == 5
+        assert all(-1 <= ic <= 1 for ic in ic_series.values)
+        assert isinstance(ic_series, pd.Series)
+        assert ic_series.index.equals(dates)
+    
+    def test_ic_threshold_validation(self):
+        """Test that IC > 0.05 threshold can be validated."""
+        from factors.validation import calculate_ic
+        
+        # Create positively correlated data (should have IC > 0.05)
+        np.random.seed(42)
+        n = 100
+        factors = pd.Series(np.random.randn(n))
+        # Add correlation: returns = 0.1 * factors + noise
+        returns = pd.Series(0.1 * factors + np.random.randn(n) * 0.5)
+        
+        ic = calculate_ic(factors, returns)
+        
+        assert ic > 0.05, f"IC should be > 0.05 for correlated data, got {ic:.4f}"
+        assert -1 <= ic <= 1
 
 
 # =============================================================================

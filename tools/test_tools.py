@@ -314,6 +314,40 @@ class TestPortfolioQueryTool:
         assert result["success"] is True
         assert result["data"] is not None
 
+    def test_invoke_get_portfolio_exposure(self):
+        """Tool should wrap get_portfolio_exposure function."""
+        tool = PortfolioQueryTool()
+        
+        mock_exposure_data = {
+            "sector_exposure": [{"sector": "Technology", "count": 10, "total_market_cap": 1000000}],
+            "top_industries": [{"industry": "Software", "count": 5}]
+        }
+        
+        with patch('data.db_schema.get_portfolio_exposure') as mock_exposure:
+            mock_exposure.return_value = mock_exposure_data
+            
+            result = tool.invoke({
+                "action": "get_portfolio_exposure",
+            })
+        
+        assert result["success"] is True
+        assert "sector_exposure" in result["data"]
+        assert "top_industries" in result["data"]
+        mock_exposure.assert_called_once()
+
+    def test_invoke_get_portfolio_summary(self):
+        """Tool should handle get_portfolio_summary action."""
+        tool = PortfolioQueryTool()
+        
+        # Test that the action is processed without unhandled exceptions
+        result = tool.invoke({
+            "action": "get_portfolio_summary",
+        })
+        
+        # Verify the response structure is valid
+        assert "success" in result
+        assert "data" in result or "error" in result
+
 
 class TestToolRegistry:
     """Tests for ToolRegistry."""

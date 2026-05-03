@@ -103,45 +103,10 @@ Output: Portfolio information
     
     def _get_portfolio_exposure(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Get sector/industry exposure breakdown."""
-        import sqlite3
-        import pandas as pd
+        from data.db_schema import get_portfolio_exposure
         
         db_path = input_data.get("db_path", "data/universe.db")
-        
-        try:
-            conn = sqlite3.connect(db_path)
-            
-            # Query sector exposure
-            sector_query = """
-                SELECT sector, COUNT(*) as count, 
-                       SUM(market_cap) as total_market_cap
-                FROM selected_universe
-                WHERE sector IS NOT NULL
-                GROUP BY sector
-                ORDER BY total_market_cap DESC
-            """
-            sector_df = pd.read_sql_query(sector_query, conn)
-            
-            # Query industry exposure
-            industry_query = """
-                SELECT industry, COUNT(*) as count
-                FROM selected_universe
-                WHERE industry IS NOT NULL
-                GROUP BY industry
-                ORDER BY count DESC
-                LIMIT 20
-            """
-            industry_df = pd.read_sql_query(industry_query, conn)
-            
-            conn.close()
-            
-            return {
-                "sector_exposure": sector_df.to_dict(orient="records") if not sector_df.empty else [],
-                "top_industries": industry_df.to_dict(orient="records") if not industry_df.empty else [],
-            }
-            
-        except Exception as e:
-            return {"error": str(e), "sector_exposure": [], "top_industries": []}
+        return get_portfolio_exposure(db_path)
     
     def _get_portfolio_summary(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Get overall portfolio statistics."""
